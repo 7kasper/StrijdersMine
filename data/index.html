@@ -1,0 +1,137 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>ESP Relays</title>
+    <style>
+        body {
+            font-family: system-ui, Arial, sans-serif;
+            margin: 0;
+            padding: 12px;
+            background: #111;
+            color: #eee;
+        }
+
+        h1 {
+            font-size: 18px;
+            margin: 0 0 10px 0;
+        }
+
+        .row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 0;
+            border-bottom: 1px solid #222;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+        }
+
+        @media(min-width:600px) {
+            .grid {
+                grid-template-columns: repeat(4, 1fr);
+            }
+        }
+
+        .card {
+            background: #1b1b1b;
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            padding: 10px;
+        }
+
+        .title {
+            font-weight: 600;
+        }
+
+        .state {
+            font-family: monospace;
+        }
+
+        .switch {
+            transform: scale(1.3);
+        }
+
+        .good {
+            color: #4caf50;
+        }
+
+        .bad {
+            color: #f44336;
+        }
+
+        .muted {
+            color: #aaa;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>ESP8266 Relays</h1>
+    <div class="row"> <label><input id="enable" type="checkbox"> Buttons drive relays</label> <span id="net"
+            class="muted"></span> </div>
+    <div class="grid" id="grid"></div>
+    <script> 
+        const grid = document.getElementById('grid'); 
+        const enable = document.getElementById('enable'); 
+        const net = document.getElementById('net'); 
+        
+        // Build 16 cards 
+        for (let i = 0; i < 16; i++) {
+            const c = document.createElement('div');
+            c.className = 'card';
+            c.innerHTML = ` <div class="title">Relay ${i.toString(16).toUpperCase()}</div> <div>Button: <span class="btn state">-</span></div> <div>Relay: <span class="rel state">-</span></div> <label>Set <input class="switch" type="checkbox"></label> `;
+            c.dataset.index = i;
+            grid.appendChild(c);
+        }
+        grid.addEventListener('change', async (e) => { 
+            if (e.target.classList.contains('switch')) { 
+                const card = e.target.closest('.card'); 
+                const id = parseInt(card.dataset.index, 10); 
+                const level = e.target.checked ? 1 : 0; 
+                await fetch('/api/relay', { 
+                    method: 'POST', 
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, 
+                    body: new URLSearchParams({ id, level }) 
+                });
+            } 
+        }); 
+        enable.addEventListener('change', async () => { 
+            const value = enable.checked ? 1 : 0; 
+            await fetch('/api/enable', { 
+                method: 'POST', 
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, 
+                body: new URLSearchParams({ value }) 
+            }); 
+        }); 
+        function bit(v, i) { 
+            return ((v >>> i) & 1) === 1; 
+        } 
+        async function refresh() { 
+            try { 
+                const r = await fetch('/api/state'); 
+                const s = await r.json(); enable.checked = !!s.enabled; // s.buttons: 1=pressed; s.relays: 1=ON 
+                for (let i=0;i<16;i++){ 
+                    const card = grid.children[i]; const btn = bit(s.buttons, i); 
+                    const rel = bit(s.relays, i); 
+                    card.querySelector('.btn').textContent = btn ? 'PRESSED' : 'idle'; 
+                    card.querySelector('.btn').className = 'btn state ' + (btn?'good':'muted'); 
+                    card.querySelector('.rel').textContent = rel ? 'ON' : 'OFF'; 
+                    card.querySelector('.rel').className = 'rel state ' + (rel?'good':'bad'); 
+                    const sw = card.querySelector('.switch'); 
+                    if (sw.checked !== rel) sw.checked = rel; 
+                } 
+                net.textContent = ''; 
+            } catch (e) { net.textContent = 'Disconnected...'; } 
+        } 
+        setInterval(refresh, 300); refresh(); 
+    </script>
+</body>
+
+</html>
