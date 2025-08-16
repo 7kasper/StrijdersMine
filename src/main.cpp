@@ -37,6 +37,9 @@ static const float DEFAULT_MINE_RATIO = 0.60f;
 
 static uint8_t currentSection = 0;
 static bool mines[GRID_ROWS][GRID_COLS];
+static bool exploded[GRID_ROWS][GRID_COLS]; // true = exploded (latched until reset) 
+static bool stepped[GRID_ROWS][GRID_COLS];
+
 // Non-blocking 500 timers for the mines
 static uint32_t relayOffAt[16] = {0};
 
@@ -75,7 +78,8 @@ IPAddress netMsk(255,255,255,0);
 // =        Variables        = //
 // =========================== //
 
-bool buttonsDriveRelays = true;    // when true, physical buttons control relays
+bool debugMode = false;    // when true, physical buttons control relays
+static bool hideOtherSections = false; // include in /api/field, controllable via /api/prefs
 volatile uint16_t lastButtonsMask = 0; // latest read from MCP (1=pressed)
 
 // =========================== //
@@ -252,6 +256,163 @@ static void mcpBegin() {
     mcpWrite8(MCP_GPPUB,  0xFF); // Port B pull-ups enabled
 }
 
+
+// =========================== //
+// =     Game Functions      = //
+// =========================== //
+
+/**
+ * Debug print: X = mine, . = safe. Rows 1..12, Cols 1..4
+ */
+void printMinefield() {
+    Serial.println("Minefield (rows x cols): X=mine . =safe");
+    for (uint8_t r = 0; r < GRID_ROWS; r++) {
+        Serial.printf("%2u: ", r + 1);
+        for (uint8_t c = 0; c < GRID_COLS; c++) {
+            Serial.print(mines[r][c] ? 'X' : '.');
+        }
+        Serial.println();
+    }
+    Serial.printf("Current section: %u (rows %u..%u)\n", currentSection + 1,
+                  currentSection * SECTION_ROWS + 1,
+                  currentSection * SECTION_ROWS + SECTION_ROWS);
+}
+
+// Section helpers
+void setSection(uint8_t s) {
+    if (s >= NUM_SECTIONS)
+        s = NUM_SECTIONS - 1;
+    currentSection = s;
+    Serial.printf("Section set to %u (rows %u..%u)\n", currentSection + 1,
+                  currentSection * SECTION_ROWS + 1,
+                  currentSection * SECTION_ROWS + SECTION_ROWS);
+}
+void nextSection() {
+    if (currentSection + 1 < NUM_SECTIONS)
+        setSection(currentSection + 1);
+}
+void prevSection() {
+    if (currentSection > 0)
+        setSection(currentSection - 1);
+}
+
+// Pack a row’s 4 bools into a 4-bit mask (bit0=col0..bit3=col3)
+static uint8_t packRow(bool rowArr[GRID_COLS]) {
+    uint8_t m = 0;
+    for (uint8_t c = 0; c < GRID_COLS; c++) if (rowArr[c]) m |= (1U << c);
+    return m;
+}
+
+/**
+ * Map a 4x4 pad pin (0..15) to global (row, col) in the 4x12 minefield for a given
+ * section pin 0 -> (row1,col1), pin 1 -> (row1,col2), pin 4 -> (row2,col1), pin 15 ->
+ * (row4,col4) Section 1 adds +4 to the row (so pin 0 -> (row5,col1)), etc. All indices
+ * here are 0-based internally; for printing, add +1.
+ * @param pin - The pin to map
+ * @param row - The reference to the (global) row to return
+ * @param col - The reference to the column to return
+ */
+static void pinToRowCol(uint8_t pin, uint8_t& row, uint8_t& col) {
+    col = pin % GRID_COLS;                              // 0..3
+    uint8_t localRow = pin / GRID_COLS;                 // 0..3
+    row = currentSection * SECTION_ROWS + localRow;     // 0..11
+}
+
+// Clear exploded and stepped tracking
+static void clearMinefieldRuntime() {
+    for (uint8_t r = 0; r < GRID_ROWS; r++) {
+        for (uint8_t c = 0; c < GRID_COLS; c++) {
+            exploded[r][c] = false;
+            stepped[r][c] = false;
+        }
+    }
+}
+
+/**
+ * Populates the minefield with the set mineratio. Ensures each row has at least 1 free safe cell.
+ */
+void generateMinefield(float mineRatio) {
+    // Seed RNG (lightweight)
+    randomSeed(ESP.getChipId() ^ micros());
+    for (uint8_t r = 0; r < GRID_ROWS; r++) {
+        uint8_t safeCount = 0;
+        for (uint8_t c = 0; c < GRID_COLS; c++) {
+            bool m = (random(1000) < (int)(mineRatio * 1000.0f));
+            mines[r][c] = m;
+            if (!m)
+                safeCount++;
+        }
+        if (safeCount == 0) {
+            // Force at least one safe cell in this row
+            uint8_t safeCol = random(GRID_COLS);
+            mines[r][safeCol] = false;
+        }
+    }
+    clearMinefieldRuntime(); // reset exploded + stepped masks
+    printMinefield();
+}
+
+/**
+ * Resets/regenerates the minefield.
+ */
+void resetMinefield(float ratio) {
+    generateMinefield(ratio);
+    setSection(0);
+}
+
+// Start a timed pulse on a relay (non-blocking)
+void triggerRelayPulse(uint8_t relayIndex, uint16_t ms) {
+    if (relayIndex > 15)
+        return;
+    writeRelay((RelayId)relayIndex, HIGH);
+    relayOffAt[relayIndex] = millis() + ms;
+}
+
+// Turn off any relays whose pulse expired
+void serviceRelayPulses() {
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < 16; i++) {
+        if (relayOffAt[i] != 0 && (int32_t)(now - relayOffAt[i]) >= 0) {
+            writeRelay((RelayId)i, LOW);
+            relayOffAt[i] = 0;
+        }
+    }
+}
+
+// Handle button presses for minefield logic:
+// On rising edge of a button in the current section, if that (row,col) is a mine ->
+// pulse relay 500 ms.
+void handleMinefieldButtons(uint16_t pressedMask) {
+    static uint16_t last = 0;
+    uint16_t rising = pressedMask & ~last;  // new presses only
+    last = pressedMask;
+
+    // Process new presses (rising edges)
+    for (uint8_t pin = 0; pin < 16; pin++) {
+        if (rising & (1U << pin)) {
+            uint8_t row, col;
+            pinToRowCol(pin, row, col);
+            if (row < GRID_ROWS && col < GRID_COLS) {
+                stepped[row][col] = true;
+                if (mines[row][col]) {
+                    if (!exploded[row][col]) {
+                        exploded[row][col] = true;    // latch explosion
+                        triggerRelayPulse(pin, 500);  // 500 ms solenoid pulse
+                        Serial.printf("Mine EXPLODED: pin %u -> (row %u, col %u)\n",
+                                      pin, row + 1, col + 1);
+                    } else {
+                        Serial.printf("Mine already exploded: (row %u, col %u)\n",
+                                      row + 1, col + 1);
+                    }
+                } else {
+                    Serial.printf("Safe: pin %u -> (row %u, col %u)\n", pin, row + 1,
+                                  col + 1);
+                }
+            }
+        }
+    }
+}
+
 // =========================== //
 // =     WiFi Functions      = //
 // =========================== //
@@ -333,9 +494,9 @@ static bool beginWiFi() {
     // Serial.println("WiFi connect failed. Starting AP...");
     startAP();
 
-    if (WiFi.status() == WL_CONNECTED) {
-        startMDNS();
-    }
+    // if (WiFi.status() == WL_CONNECTED) {
+    //     startMDNS();
+    // }
     return false;
 }
 
@@ -357,7 +518,7 @@ static void setupWebServer() {
         String json = "{";
         json += "\"buttons\":" + String(lastButtonsMask);
         json += ",\"relays\":" + String(relayState);
-        json += ",\"enabled\":" + String(buttonsDriveRelays ? "true" : "false");
+        json += ",\"debug\":" + String(debugMode ? "true" : "false");
         json += "}";
         server.send(200, "application/json", json);
     });
@@ -385,8 +546,113 @@ static void setupWebServer() {
             return;
         }
         String v = server.arg("value");
-        buttonsDriveRelays = (v == "1" || v == "true" || v == "on");
-        server.send(200, "text/plain", buttonsDriveRelays ? "ENABLED" : "DISABLED");
+        debugMode = (v == "1" || v == "true" || v == "on");
+        server.send(200, "text/plain", debugMode ? "ENABLED" : "DISABLED");
+    });
+
+    // 4x12 field state
+    server.on("/api/field", HTTP_GET, [](){
+        String json = "{\"rows\":" + String(GRID_ROWS) + ",\"cols\":" + String(GRID_COLS);
+        json += ",\"section\":" + String(currentSection);
+        json += ",\"hideOthers\":" + String(hideOtherSections ? "true" : "false");
+        json += ",\"debugMode\":" + String(debugMode ? "true" : "false");
+        // mines, exploded, stepped as arrays of 12 integers (4-bit masks per row)
+        json += ",\"mines\":[";
+        for (uint8_t r = 0; r < GRID_ROWS; r++) {
+            uint8_t m = packRow(mines[r]);
+            json += String(m);
+            if (r != GRID_ROWS - 1)
+                json += ",";
+        }
+        json += "]";
+        json += ",\"exploded\":[";
+        for (uint8_t r = 0; r < GRID_ROWS; r++) {
+            uint8_t e = 0;
+            for (uint8_t c = 0; c < GRID_COLS; c++)
+                if (exploded[r][c])
+                    e |= (1U << c);
+            json += String(e);
+            if (r != GRID_ROWS - 1)
+                json += ",";
+        }
+        json += "]";
+        json += ",\"stepped\":[";
+        for (uint8_t r = 0; r < GRID_ROWS; r++) {
+            uint8_t m = packRow(stepped[r]);
+            json += String(m);
+            if (r != GRID_ROWS - 1)
+                json += ",";
+        }
+        json += "]";
+        json += "}";
+        server.send(200, "application/json", json);
+    });
+
+    // Section control: POST /api/section with dir=1/-1 or index=0..2
+    server.on("/api/section", HTTP_POST, [](){
+        if (server.hasArg("index")) {
+            int idx = server.arg("index").toInt();
+            if (idx < 0)
+                idx = 0;
+            if (idx > (int)NUM_SECTIONS - 1)
+                idx = NUM_SECTIONS - 1;
+            setSection((uint8_t)idx);
+            server.send(200, "text/plain", "OK");
+            return;
+        }
+        if (server.hasArg("dir")) {
+            int dir = server.arg("dir").toInt();
+            if (dir > 0)
+                nextSection();
+            else if (dir < 0)
+                prevSection();
+            server.send(200, "text/plain", "OK");
+            return;
+        }
+        server.send(400, "text/plain", "index or dir required");
+    });
+
+    // Reset field: POST /api/field/reset?ratio=0.6
+    server.on("/api/field/reset", HTTP_POST, [](){
+        float ratio = DEFAULT_MINE_RATIO;
+        if (server.hasArg("ratio"))
+            ratio = server.arg("ratio").toFloat();
+        if (ratio < 0.0f)
+            ratio = 0.0f;
+        if (ratio > 1.0f)
+            ratio = 1.0f;
+        resetMinefield(ratio);
+        server.send(200, "text/plain", "RESET");
+    });
+
+    // Toggle a cell's mine state: POST /api/field/toggle?row=R&col=C
+    server.on("/api/field/toggle", HTTP_POST, [](){
+        if (!server.hasArg("row") || !server.hasArg("col")) {
+            server.send(400, "text/plain", "row,col required");
+            return;
+        }
+        int r = server.arg("row").toInt();
+        int c = server.arg("col").toInt();
+        if (r < 0 || r >= GRID_ROWS || c < 0 || c >= GRID_COLS) {
+            server.send(400, "text/plain", "out of range");
+            return;
+        }
+        mines[r][c] = !mines[r][c];
+        exploded[r][c] = false;  // reset explosion latch when toggled
+        server.send(200, "text/plain", "OK");
+    });
+
+    // UI prefs: POST /api/prefs?hideOthers=0/1
+    server.on("/api/prefs", HTTP_POST, [](){
+        if (server.hasArg("hideOthers")) {
+            String v = server.arg("hideOthers");
+            hideOtherSections = (v == "1" || v == "true" || v == "on");
+        }
+        if (server.hasArg("debugMode")) {
+            String v = server.arg("debugMode");
+            debugMode = (v == "1" || v == "true" || v == "on");
+        }
+        server.send(200, "text/plain", "OK");
     });
 
     // Captive portal urls
@@ -424,141 +690,6 @@ static void setupWebServer() {
 }
 
 // =========================== //
-// =     Game Functions      = //
-// =========================== //
-
-/**
- * Debug print: X = mine, . = safe. Rows 1..12, Cols 1..4
- */
-void printMinefield() {
-    Serial.println("Minefield (rows x cols): X=mine . =safe");
-    for (uint8_t r = 0; r < GRID_ROWS; r++) {
-        Serial.printf("%2u: ", r + 1);
-        for (uint8_t c = 0; c < GRID_COLS; c++) {
-            Serial.print(mines[r][c] ? 'X' : '.');
-        }
-        Serial.println();
-    }
-    Serial.printf("Current section: %u (rows %u..%u)\n", currentSection + 1,
-                  currentSection * SECTION_ROWS + 1,
-                  currentSection * SECTION_ROWS + SECTION_ROWS);
-}
-
-// Section helpers
-void setSection(uint8_t s) {
-    if (s >= NUM_SECTIONS)
-        s = NUM_SECTIONS - 1;
-    currentSection = s;
-    Serial.printf("Section set to %u (rows %u..%u)\n", currentSection + 1,
-                  currentSection * SECTION_ROWS + 1,
-                  currentSection * SECTION_ROWS + SECTION_ROWS);
-}
-void nextSection() {
-    if (currentSection + 1 < NUM_SECTIONS)
-        setSection(currentSection + 1);
-}
-void prevSection() {
-    if (currentSection > 0)
-        setSection(currentSection - 1);
-}
-
-/**
- * Map a 4x4 pad pin (0..15) to global (row, col) in the 4x12 minefield for a given
- * section pin 0 -> (row1,col1), pin 1 -> (row1,col2), pin 4 -> (row2,col1), pin 15 ->
- * (row4,col4) Section 1 adds +4 to the row (so pin 0 -> (row5,col1)), etc. All indices
- * here are 0-based internally; for printing, add +1.
- * @param pin - The pin to map
- * @param row - The reference to the (global) row to return
- * @param col - The reference to the column to return
- */
-static void pinToRowCol(uint8_t pin, uint8_t& row, uint8_t& col) {
-    col = pin % GRID_COLS;                              // 0..3
-    uint8_t localRow = pin / GRID_COLS;                 // 0..3
-    row = currentSection * SECTION_ROWS + localRow;     // 0..11
-}
-
-/**
- * Populates the minefield with the set mineratio. Ensures each row has at least 1 free safe cell.
- */
-void generateMinefield(float mineRatio) {
-    // Seed RNG (lightweight)
-    randomSeed(ESP.getChipId() ^ micros());
-    for (uint8_t r = 0; r < GRID_ROWS; r++) {
-        uint8_t safeCount = 0;
-        for (uint8_t c = 0; c < GRID_COLS; c++) {
-            bool m = (random(1000) < (int)(mineRatio * 1000.0f));
-            mines[r][c] = m;
-            if (!m)
-                safeCount++;
-        }
-        if (safeCount == 0) {
-            // Force at least one safe cell in this row
-            uint8_t safeCol = random(GRID_COLS);
-            mines[r][safeCol] = false;
-        }
-    }
-    printMinefield();
-}
-
-/**
- * Resets/regenerates the minefield.
- */
-void resetMinefield() {
-    generateMinefield(DEFAULT_MINE_RATIO);
-    setSection(0);
-}
-
-// Start a timed pulse on a relay (non-blocking)
-void triggerRelayPulse(uint8_t relayIndex, uint16_t ms) {
-    if (relayIndex > 15)
-        return;
-    writeRelay((RelayId)relayIndex, HIGH);
-    relayOffAt[relayIndex] = millis() + ms;
-}
-
-// Turn off any relays whose pulse expired
-void serviceRelayPulses() {
-    uint32_t now = millis();
-    for (uint8_t i = 0; i < 16; i++) {
-        if (relayOffAt[i] != 0 && (int32_t)(now - relayOffAt[i]) >= 0) {
-            writeRelay((RelayId)i, LOW);
-            relayOffAt[i] = 0;
-        }
-    }
-}
-
-// Handle button presses for minefield logic:
-// On rising edge of a button in the current section, if that (row,col) is a mine ->
-// pulse relay 500 ms.
-void handleMinefieldButtons(uint16_t pressedMask) {
-    static uint16_t last = 0;
-    uint16_t rising = pressedMask & ~last;  // new presses only
-    last = pressedMask;
-
-    for (uint8_t pin = 0; pin < 16; pin++) { // Go through all buttons
-        if (rising & (1U << pin)) { // Check if the button is active
-            uint8_t row, col;
-            pinToRowCol(pin, row, col);
-            if (row < GRID_ROWS && col < GRID_COLS) { // Sanity check.
-                if (mines[row][col]) {
-                    // Mine: fire solenoid for 500 ms
-                    triggerRelayPulse(pin, SOLENOID_FIRE_TIME);
-                    Serial.printf(
-                        "Mine HIT: pin %u -> (row %u, col %u) -> pulse relay %u\n", pin,
-                        row + 1, col + 1, pin);
-                } else {
-                    // Safe: do nothing (ensure relay stays off)
-                    Serial.printf("Safe: pin %u -> (row %u, col %u)\n", pin, row + 1,
-                                  col + 1);
-                }
-            }
-        }
-    }
-}
-
-
-
-// =========================== //
 // =          SETUP          = //
 // =========================== //
 
@@ -594,7 +725,7 @@ void setup() {
     setupWebServer();
 
     Serial.println("Generating minefield...");
-    resetMinefield();
+    resetMinefield(DEFAULT_MINE_RATIO);
 
     Serial.println("READY.");
 }
@@ -615,7 +746,7 @@ void loop() {
         lastPoll = millis();
         uint16_t pressed = getButtonStates();  // 1=pressed for bit i
         lastButtonsMask = pressed;
-        if (buttonsDriveRelays) {
+        if (debugMode) {
             // Hold-to-activate: pressed => relay ON
             relayState = pressed;
             writeOutputs(relayState);

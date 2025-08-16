@@ -4,133 +4,526 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>ESP Relays</title>
+    <title>Minefield</title>
     <style>
+        :root {
+            --bg: #0b0b0b;
+            --fg: #eaeaea;
+            --neon: #39ff14;
+            --red: #ff3b3b;
+            --grid-border: 1px solid var(--neon);
+            --highlight: 3px solid var(--neon);
+            --shadow-neon: 0 0 8px rgba(57, 255, 20, 0.9), 0 0 16px rgba(57, 255, 20, 0.5);
+            --shadow-red: 0 0 8px rgba(255, 59, 59, 0.9), 0 0 16px rgba(255, 59, 59, 0.5);
+        }
+
+        html,
         body {
-            font-family: system-ui, Arial, sans-serif;
             margin: 0;
+            padding: 0;
+            background: var(--bg);
+            color: var(--fg);
+            font-family: system-ui, Arial, sans-serif;
+        }
+
+        .wrap {
+            max-width: 900px;
+            margin: 0 auto;
             padding: 12px;
-            background: #111;
-            color: #eee;
         }
 
         h1 {
-            font-size: 18px;
-            margin: 0 0 10px 0;
-        }
-
-        .row {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            padding: 8px 0;
-            border-bottom: 1px solid #222;
+            width: 100%;
+            text-align: center;
+            font-size: 6vw;
+            margin: 0 0 8px 0;
+            color: var(--neon);
+            text-shadow: var(--shadow-neon);
         }
 
         .grid {
             display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 10px;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0;
+            width: 100%;
+            background: #000;
+            box-shadow: var(--shadow-neon);
         }
 
-        @media(min-width:600px) {
-            .grid {
-                grid-template-columns: repeat(4, 1fr);
-            }
+        .cell {
+            position: relative;
+            aspect-ratio: 1 / 1;
+            border-right: var(--grid-border);
+            border-bottom: var(--grid-border);
+            box-sizing: border-box;
         }
 
-        .card {
-            background: #1b1b1b;
-            border: 1px solid #2a2a2a;
+        .cell.edge-top {
+            border-top: 0 !important;
+        }
+
+        .cell.edge-bottom {
+            border-bottom: 0 !important;
+        }
+
+        .cell.edge-left {
+            border-left: 0 !important;
+        }
+
+        .cell.edge-right {
+            border-right: 0 !important;
+        }
+
+        .section-top {
+            border-top: var(--highlight) !important;
+        }
+
+        .section-bottom {
+            border-bottom: var(--highlight) !important;
+        }
+
+        .section-left {
+            border-left: var(--highlight) !important;
+        }
+
+        .section-right {
+            border-right: var(--highlight) !important;
+        }
+
+        /* Mine dot (neon green), perfectly round */
+        .cell.mine::before {
+            content: "";
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: 58%;
+            height: 58%;
+            transform: translate(-50%, -50%);
+            border-radius: 50%;
+            background: var(--neon);
+            box-shadow: var(--shadow-neon);
+        }
+
+        /* Exploded mine ->red dot with glow */
+        .cell.mine.exploded::before {
+            background: var(--red);
+            box-shadow: var(--shadow-red);
+        }
+
+        .cell.hidden {
+            visibility: hidden;
+        }
+
+        /* hides content but keeps grid spacing */
+
+        /* Pressed: white inset outline hugging the tile border (doesn’t cover dot) */
+        .cell.pressed::after {
+            content: "";
+            position: absolute;
+            inset: 6%;
+            border: 2px solid rgba(255, 255, 255, 0.95);
             border-radius: 8px;
-            padding: 10px;
+            box-shadow:
+                inset 0 0 8px rgba(255, 255, 255, 0.9),
+                0 0 4px rgba(255, 255, 255, 0.5);
+            background: transparent;
+            z-index: 2;
         }
 
-        .title {
-            font-weight: 600;
+        /* Yellow section frame overlay (outside-only border and glow) */
+        .gridWrap {
+            position: relative;
         }
 
-        .state {
-            font-family: monospace;
+        #sectionFrame {
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 0;
+            height: 0;
+            border: 3px solid #ffd400;
+            /* yellow */
+            box-shadow: 0 0 10px rgba(255, 212, 0, 0.8), 0 0 18px rgba(255, 212, 0, 0.5);
+            pointer-events: none;
+            display: none;
+            /* shown when positioned */
+            border-left-width: 3px;
+            border-right-width: 3px;
+        }
+        .controls {
+            text-align: center;
         }
 
-        .switch {
-            transform: scale(1.3);
+        .controlbuttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 12px;
+            flex-wrap: wrap;
         }
 
-        .good {
-            color: #4caf50;
+        button {
+            flex: 1 1 30%;
+            min-width: 120px;
+            padding: 10px 12px;
+            font-size: 16px;
+            background: #101c10;
+            color: var(--neon);
+            border: 1px solid var(--neon);
+            border-radius: 8px;
+            box-shadow: var(--shadow-neon);
+            cursor: pointer;
         }
 
-        .bad {
-            color: #f44336;
+        .redbtn {
+            border: 1px solid var(--red);
+            box-shadow: var(--red);
+            color: var(--red);
+
         }
 
-        .muted {
-            color: #aaa;
+        button:active {
+            transform: translateY(1px);
+        }
+
+        .status {
+            width: 100%;
+            text-align: center;
+            margin-top: 8px;
+            font-size: 12px;
+            opacity: 0.75;
+        }
+
+        .greentext {
+            width: 100%;
+            text-align: center;
+            margin-top: 8px;
+            font-size: 12px;
+            opacity: 0.75;
+            color: var(--neon);
+            text-shadow: var(--shadow-neon);
+        }
+
+        a {
+            color: var(--neon);
         }
     </style>
 </head>
 
 <body>
-    <h1>ESP8266 Relays</h1>
-    <div class="row"> <label><input id="enable" type="checkbox"> Buttons drive relays</label> <span id="net"
-            class="muted"></span> </div>
-    <div class="grid" id="grid"></div>
-    <script> 
-        const grid = document.getElementById('grid'); 
-        const enable = document.getElementById('enable'); 
-        const net = document.getElementById('net'); 
-        
-        // Build 16 cards 
-        for (let i = 0; i < 16; i++) {
-            const c = document.createElement('div');
-            c.className = 'card';
-            c.innerHTML = ` <div class="title">Relay ${i.toString(16).toUpperCase()}</div> <div>Button: <span class="btn state">-</span></div> <div>Relay: <span class="rel state">-</span></div> <label>Set <input class="switch" type="checkbox"></label> `;
-            c.dataset.index = i;
-            grid.appendChild(c);
+    <div class="wrap">
+        <h1>Mijnenveld</h1>
+        <div class="gridWrap">
+            <div id="grid" class="grid" aria-label="4x12 minefield grid"></div>
+            <div id="sectionFrame"></div>
+        </div>
+        <div class="controls">
+            <div class="controlbuttons">
+                <button id="prev">Vorige Sectie</button>
+                <button id="reset" class="redbtn">Reset Veld</button>
+                <button id="next">Volgende Sectie</button>
+            </div>
+            <label><input type="checkbox" id="sound"> Sound</label>
+            <label><input type="checkbox" id="hideOthers">Verstop andere secties</label>
+            <label><input type="checkbox" id="debug">Debug</label>
+        </div>
+        <div class="status" id="status"></div>
+        <div class="greentext">Gemaakt door <a href="https://kaspermuller.nl">Kasper Müller</a></div>
+    </div>
+
+    <script>
+        let audioCtx = null;
+        let soundEnabled = true;
+        let prevPressed = new Array(12).fill(0);   // 4-bit masks per row
+        let prevExploded = new Array(12).fill(0);  // 4-bit masks per row
+        let lastSection = 0;                       // keep current section for frame
+
+        function ensureAudio() {
+            if (!soundEnabled) return;
+            if (!audioCtx) {
+                const Ctx = window.AudioContext || window.webkitAudioContext;
+                if (!Ctx) return; // very old browser
+                audioCtx = new Ctx();
+            }
+            if (audioCtx.state === 'suspended') audioCtx.resume();
         }
-        grid.addEventListener('change', async (e) => { 
-            if (e.target.classList.contains('switch')) { 
-                const card = e.target.closest('.card'); 
-                const id = parseInt(card.dataset.index, 10); 
-                const level = e.target.checked ? 1 : 0; 
-                await fetch('/api/relay', { 
-                    method: 'POST', 
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, 
-                    body: new URLSearchParams({ id, level }) 
-                });
-            } 
-        }); 
-        enable.addEventListener('change', async () => { 
-            const value = enable.checked ? 1 : 0; 
-            await fetch('/api/enable', { 
-                method: 'POST', 
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, 
-                body: new URLSearchParams({ value }) 
-            }); 
-        }); 
-        function bit(v, i) { 
-            return ((v >>> i) & 1) === 1; 
-        } 
-        async function refresh() { 
-            try { 
-                const r = await fetch('/api/state'); 
-                const s = await r.json(); enable.checked = !!s.enabled; // s.buttons: 1=pressed; s.relays: 1=ON 
-                for (let i=0;i<16;i++){ 
-                    const card = grid.children[i]; const btn = bit(s.buttons, i); 
-                    const rel = bit(s.relays, i); 
-                    card.querySelector('.btn').textContent = btn ? 'PRESSED' : 'idle'; 
-                    card.querySelector('.btn').className = 'btn state ' + (btn?'good':'muted'); 
-                    card.querySelector('.rel').textContent = rel ? 'ON' : 'OFF'; 
-                    card.querySelector('.rel').className = 'rel state ' + (rel?'good':'bad'); 
-                    const sw = card.querySelector('.switch'); 
-                    if (sw.checked !== rel) sw.checked = rel; 
-                } 
-                net.textContent = ''; 
-            } catch (e) { net.textContent = 'Disconnected...'; } 
-        } 
-        setInterval(refresh, 300); refresh(); 
+
+        function playClick() {
+            if (!soundEnabled) return;
+            ensureAudio();
+            if (!audioCtx) return;
+
+            const t = audioCtx.currentTime + 0.005;
+
+            // Main click: very short high-passed noise burst
+            const dur = 0.045; // ~45 ms
+            const nSamples = Math.floor(audioCtx.sampleRate * dur);
+            const buf = audioCtx.createBuffer(1, nSamples, audioCtx.sampleRate);
+            const ch = buf.getChannelData(0);
+            for (let i = 0; i < nSamples; i++) {
+                // White noise with fast exponential decay (mechanical snap)
+                const x = Math.random() * 2 - 1;
+                const env = Math.exp(-i / (audioCtx.sampleRate * 0.007)); // ~7 ms time constant
+                ch[i] = x * env;
+            }
+
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buf;
+
+            const hp = audioCtx.createBiquadFilter();
+            hp.type = 'highpass';
+            hp.frequency.value = 2200; // emphasize clicky highs
+            hp.Q.value = 0.7;
+
+            const g = audioCtx.createGain();
+            g.gain.setValueAtTime(0.18, t); // overall level
+            g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+
+            noise.connect(hp).connect(g).connect(audioCtx.destination);
+            noise.start(t);
+            noise.stop(t + dur);
+
+            // Tiny "release" tick: very short bandpass noise a moment later
+            const relOff = 0.045; // when the key bottoms out/release tick
+            const relDur = 0.018;
+            const n2 = Math.floor(audioCtx.sampleRate * relDur);
+            const buf2 = audioCtx.createBuffer(1, n2, audioCtx.sampleRate);
+            const ch2 = buf2.getChannelData(0);
+            for (let i = 0; i < n2; i++) {
+                const x = Math.random() * 2 - 1;
+                const env = Math.exp(-i / (audioCtx.sampleRate * 0.004)); // even snappier
+                ch2[i] = x * env;
+            }
+            const noise2 = audioCtx.createBufferSource();
+            noise2.buffer = buf2;
+
+            const bp = audioCtx.createBiquadFilter();
+            bp.type = 'bandpass';
+            bp.frequency.value = 1800;
+            bp.Q.value = 1.2;
+
+            const g2 = audioCtx.createGain();
+            g2.gain.setValueAtTime(0.08, t + relOff);
+            g2.gain.exponentialRampToValueAtTime(0.0001, t + relOff + relDur);
+
+            noise2.connect(bp).connect(g2).connect(audioCtx.destination);
+            noise2.start(t + relOff);
+            noise2.stop(t + relOff + relDur);
+        }
+
+        function playExplosion() {
+            if (!soundEnabled) return;
+            ensureAudio();
+            if (!audioCtx) return;
+            const t = audioCtx.currentTime + 0.01;
+
+            // Noise burst
+            const dur = 1.1;
+            const buf = audioCtx.createBuffer(1, Math.floor(audioCtx.sampleRate * dur), audioCtx.sampleRate);
+            const ch = buf.getChannelData(0);
+            for (let i = 0; i < ch.length; i++) {
+                const x = Math.random() * 2 - 1;
+                // fast attack, exponential decay
+                const env = Math.exp(-3 * i / ch.length);
+                ch[i] = x * env;
+            }
+            const noise = audioCtx.createBufferSource();
+            noise.buffer = buf;
+            const bp = audioCtx.createBiquadFilter();
+            bp.type = 'bandpass';
+            bp.frequency.value = 140;
+            bp.Q.value = 0.7;
+            const g = audioCtx.createGain();
+            g.gain.setValueAtTime(0.9, t);
+            g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+            noise.connect(bp).connect(g).connect(audioCtx.destination);
+            noise.start(t);
+            noise.stop(t + dur);
+
+            // Low sine boom
+            const osc = audioCtx.createOscillator();
+            const g2 = audioCtx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(90, t);
+            osc.frequency.exponentialRampToValueAtTime(30, t + 0.9);
+            g2.gain.setValueAtTime(0.35, t);
+            g2.gain.exponentialRampToValueAtTime(0.0001, t + 0.9);
+            osc.connect(g2).connect(audioCtx.destination);
+            osc.start(t);
+            osc.stop(t + 0.9);
+        }
+
+        // Unlock audio on first user gesture (mobile autoplay policies)
+        ['pointerdown', 'keydown', 'click', 'touchstart'].forEach(evt =>
+            document.addEventListener(evt, ensureAudio, { once: true, passive: true })
+        );
+
+        const soundChk = document.getElementById('sound');
+        soundChk.addEventListener('change', () => {
+            soundEnabled = soundChk.checked;
+            if (soundEnabled) ensureAudio();
+        });
+
+
+        const grid = document.getElementById('grid');
+        const statusEl = document.getElementById('status');
+        const rows = 12, cols = 4;
+
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                const cell = document.createElement('div');
+                cell.className = 'cell';
+                cell.dataset.r = r;
+                cell.dataset.c = c;
+                //Tagg cell edges.
+                if (r === 0) cell.classList.add('edge-top');
+                if (r === rows - 1) cell.classList.add('edge-bottom');
+                if (c === 0) cell.classList.add('edge-left');
+                if (c === cols - 1) cell.classList.add('edge-right');
+                grid.appendChild(cell);
+            }
+        }
+
+        grid.addEventListener('click', async (e) => {
+            const cell = e.target.closest('.cell');
+            if (!cell) return;
+            const r = parseInt(cell.dataset.r, 10);
+            const c = parseInt(cell.dataset.c, 10);
+            // Toggle mine state on the device
+            await fetch(`/api/field/toggle?row=${r}&col=${c}`, { method: 'POST' });
+            fetchField(); // refresh UI
+        });
+
+        const hideOthersEl = document.getElementById('hideOthers');
+        hideOthersEl.addEventListener('change', async () => {
+            const v = hideOthersEl.checked ? 1 : 0;
+            await fetch(`/api/prefs?hideOthers=${v}`, { method: 'POST' });
+            fetchField();
+        });
+
+        const debugEL = document.getElementById('debug');
+        debugEL.addEventListener('change', async () => {
+            const v = debugEL.checked ? 1 : 0;
+            await fetch(`/api/prefs?debugMode=${v}`, { method: 'POST' });
+            fetchField();
+        });
+
+
+        function bit(v, i) { return ((v >>> i) & 1) === 1; }
+
+        // function updateSectionHighlight(section) {
+        //     const start = section * 4;
+        //     const end = start + 3;
+        //     for (const cell of grid.children) {
+        //         const r = parseInt(cell.dataset.r, 10);
+        //         const c = parseInt(cell.dataset.c, 10);
+        //         cell.classList.toggle('section-top', r === start);
+        //         cell.classList.toggle('section-bottom', r === end);
+        //         cell.classList.toggle('section-left', ((r >= start && r <= end) && c === 0));
+        //         cell.classList.toggle('section-right', (r >= start && r <= end) && c === (cols - 1));
+        //     }
+        // }
+
+        function updateSectionHighlight(section) {
+            const frame = document.getElementById('sectionFrame');
+            if (!grid.children.length) return;
+
+            // Each tile is square; use any cell’s height as unit
+            const cellH = grid.children[0].getBoundingClientRect().height;
+            const top = section * 4 * cellH;
+            const height = 4 * cellH;
+
+            frame.style.display = 'block';
+            frame.style.top = top + 'px';
+            frame.style.height = height + 'px';
+        }
+
+        //Also, call it on resize so the frame stays aligned:
+        window.addEventListener('resize', () => {
+            // assuming you cache the last section in a variable lastSection
+            updateSectionHighlight(lastSection || 0);
+        });
+
+        async function fetchField() {
+            try {
+                const res = await fetch('/api/field');
+                const s = await res.json();
+                const mines = (s.mines || []).map(x => x | 0);
+                const exploded = (s.exploded || []).map(x => x | 0);
+                const stepped = (s.stepped || []).map(x => x | 0);
+                const hideOthers = !!s.hideOthers;
+                hideOthersEl.checked = hideOthers;
+                const debugMode = !!s.debugMode;
+                debugEL.checked = debugMode;
+                updateSectionHighlight(s.section || 0);
+                lastSection = (s.section || 0);
+
+                const start = lastSection * 4;
+                const end = start + 3;
+
+                for (const cell of grid.children) {
+                    const r = parseInt(cell.dataset.r, 10);
+                    const c = parseInt(cell.dataset.c, 10);
+                    const isMine = bit(mines[r] || 0, c);
+                    const isExploded = bit(exploded[r] || 0, c);
+                    const isPressed = bit(stepped[r] || 0, c);
+                    cell.classList.toggle('mine', isMine);
+                    cell.classList.toggle('exploded', isMine && isExploded);
+                    cell.classList.toggle('pressed', isPressed);
+                    const inSection = (r >= start && r <= end);
+                    if (hideOthers || debugMode) {
+                        cell.classList.toggle('hidden', (!inSection) || debugMode);
+                    } else {
+                        cell.classList.remove('hidden');
+                    }
+                }
+                statusEl.textContent = 'Section ' + ((s.section | 0) + 1) + ' / 3';
+
+
+                // Sounds: detect events before updating the visuals
+                let anySafeRising = false;
+                for (let r = 0; r < 12; r++) {
+                    const newExplBits = (exploded[r] & ~prevExploded[r]) & 0xF;
+                    if (newExplBits) {
+                        // play one explosion per row event to avoid overlapping too many sounds
+                        playExplosion();
+                    }
+                    // safe rising = newly pressed bits that are NOT mines
+                    const rising = (stepped[r] & ~prevPressed[r]) & 0xF;
+                    const safeRising = rising & (~mines[r] & 0xF);
+                    if (safeRising) anySafeRising = true;
+                }
+                if (anySafeRising) playClick();
+                prevPressed = stepped.slice();
+                prevExploded = exploded.slice();
+            } catch (e) {
+                console.log(e);
+                statusEl.textContent = 'Disconnected…';
+            }
+        }
+
+        document.getElementById('prev').addEventListener('click', async () => {
+            await fetch('/api/section?dir=-1', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-formurlencoded' },
+            });
+            fetchField();
+        });
+        document.getElementById('next').addEventListener('click', async () => {
+            await fetch('/api/section?dir=1', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-formurlencoded' },
+            });
+            fetchField();
+        });
+        document.getElementById('reset').addEventListener('click', async () => {
+            if (confirm('Are you sure you wish to reset the minefield?')) {
+                await fetch('/api/field/reset', { method: 'POST' });
+                fetchField();
+            }
+        });
+
+        setInterval(fetchField, 300);
+        fetchField();
     </script>
 </body>
 
