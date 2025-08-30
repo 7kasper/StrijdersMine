@@ -48,6 +48,10 @@
             width: 100%;
             background: #000;
             box-shadow: var(--shadow-neon);
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
         }
 
         .cell {
@@ -150,6 +154,7 @@
             border-left-width: 3px;
             border-right-width: 3px;
         }
+
         .controls {
             text-align: center;
         }
@@ -224,10 +229,15 @@
             </div>
             <label><input type="checkbox" id="sound"> Sound</label>
             <label><input type="checkbox" id="hideOthers">Verstop andere secties</label>
-            <label><input type="checkbox" id="debug">Debug</label>
+            <label><input type="checkbox" id="debug">Debug</label> <br />
+            <label>Mine [%] <input type="number" id="ratio" min="0" max="100" step="1" style="width:80px"></label>
+            <br />
+            <label>Pulse [ms] <input type="number" id="pulse" min="10" max="10000" step="10"
+                    style="width:100px"></label><br />
+            <button id="applyCfg">Verzend settings</button> <button id="blastAll">EXPLODEER ALLEZ</button>
         </div>
         <div class="status" id="status"></div>
-        <div class="greentext">Gemaakt door <a href="https://kaspermuller.nl">Kasper Müller</a></div>
+        <div class="greentext">Gemaakt door <a href="#">Kasper Müller</a></div>
     </div>
 
     <script>
@@ -236,6 +246,7 @@
         let prevPressed = new Array(12).fill(0);   // 4-bit masks per row
         let prevExploded = new Array(12).fill(0);  // 4-bit masks per row
         let lastSection = 0;                       // keep current section for frame
+        let lastMines = new Array(12).fill(0); // numeric 4-bit masks per row
 
         function ensureAudio() {
             if (!soundEnabled) return;
@@ -366,6 +377,20 @@
 
         const grid = document.getElementById('grid');
         const statusEl = document.getElementById('status');
+        const ratioEl = document.getElementById('ratio');
+        const pulseEl = document.getElementById('pulse');
+        const applyCfgBtn = document.getElementById('applyCfg');
+
+        applyCfgBtn.addEventListener('click', async () => {
+            const pct = Math.max(0, Math.min(100, parseInt(ratioEl.value, 10) || 0));
+            const ms = Math.max(10, Math.min(10000, parseInt(pulseEl.value, 10) || 500));
+            const ratio = (pct / 100).toFixed(3);
+            await fetch(`/api/config?mineRatio=${ratio}&pulseMs=${ms}`, { method: 'POST' });
+            // Optionally regenerate right away: 
+            //await fetch('/api/field/reset', { method:'POST' }); 
+            fetchField();
+        });
+
         const rows = 12, cols = 4;
 
         for (let r = 0; r < rows; r++) {
@@ -383,14 +408,59 @@
             }
         }
 
-        grid.addEventListener('click', async (e) => {
+        // grid.addEventListener('click', async (e) => {
+        //     const cell = e.target.closest('.cell');
+        //     if (!cell) return;
+        //     const r = parseInt(cell.dataset.r, 10);
+        //     const c = parseInt(cell.dataset.c, 10);
+        //     // Toggle mine state on the device
+        //     await fetch(`/api/field/toggle?row=${r}&col=${c}`, { method: 'POST' });
+        //     fetchField(); // refresh UI
+        // });
+
+
+        // Prevent long-press context menu on mobile
+        document.addEventListener('contextmenu', e => e.preventDefault());
+
+        let lpTimer = null;
+        let lpFired = false;
+        let lpRC = null; // remember which tile started press
+
+        grid.addEventListener('pointerdown', (e) => {
             const cell = e.target.closest('.cell');
             if (!cell) return;
             const r = parseInt(cell.dataset.r, 10);
             const c = parseInt(cell.dataset.c, 10);
-            // Toggle mine state on the device
-            await fetch(`/api/field/toggle?row=${r}&col=${c}`, { method: 'POST' });
-            fetchField(); // refresh UI
+            lpFired = false;
+            lpRC = { r, c };
+
+            lpTimer = setTimeout(async () => {
+                lpFired = true;
+                // Only explode if it is currently a mine
+                const isMine = ((lastMines[r] >>> c) & 1) === 1;
+                if (isMine) {
+                    await fetch(`/api/field/blast?row=${ r }&col=${ c }`, { method: 'POST' });
+                    if (typeof playExplosion === 'function') playExplosion();
+                    fetchField();
+                } else {
+                    // optional: play a soft click to indicate "no mine"
+                    if (typeof playClick === 'function') playClick();
+                }
+            }, 550); // long-press threshold
+        }, { passive: true });
+
+        ['pointerup', 'pointerleave', 'pointercancel'].forEach(evt => {
+            grid.addEventListener(evt, async (e) => {
+                if (!lpRC) return;
+                const { r, c } = lpRC;
+                if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+                // Short press: toggle mine (only if long press didn't trigger)
+                if (!lpFired) {
+                    await fetch(`/api/field/toggle?row=${ r } &col=${ c }`, { method: 'POST' });
+                    fetchField();
+                }
+                lpRC = null;
+            }, { passive: true });
         });
 
         const hideOthersEl = document.getElementById('hideOthers');
@@ -443,6 +513,9 @@
             updateSectionHighlight(lastSection || 0);
         });
 
+        let lastKnownRatio = 0;
+        let lastKnownPulseMs = 0;
+
         async function fetchField() {
             try {
                 const res = await fetch('/api/field');
@@ -450,10 +523,23 @@
                 const mines = (s.mines || []).map(x => x | 0);
                 const exploded = (s.exploded || []).map(x => x | 0);
                 const stepped = (s.stepped || []).map(x => x | 0);
+                lastMines = mines.slice();
                 const hideOthers = !!s.hideOthers;
                 hideOthersEl.checked = hideOthers;
                 const debugMode = !!s.debugMode;
                 debugEL.checked = debugMode;
+                if (typeof s.mineRatio !== 'undefined') {
+                    if (lastKnownRatio != s.mineRatio) {
+                        ratioEl.value = Math.round((s.mineRatio || 0) * 100);
+                        lastKnownRatio = s.mineRatio;
+                    }
+                }
+                if (typeof s.pulseMs !== 'undefined') {
+                    if (lastKnownPulseMs != s.pulseMs) {
+                        pulseEl.value = s.pulseMs;
+                        lastKnownPulseMs = s.pulseMs;
+                    }
+                }
                 updateSectionHighlight(s.section || 0);
                 lastSection = (s.section || 0);
 
@@ -520,6 +606,11 @@
                 await fetch('/api/field/reset', { method: 'POST' });
                 fetchField();
             }
+        });
+        document.getElementById('blastAll').addEventListener('click', async () => {
+            await fetch('/api/field/blast_all', { method: 'POST' });
+            if (typeof playExplosion === 'function') playExplosion(); // one global boom for feedback
+            fetchField();
         });
 
         setInterval(fetchField, 300);

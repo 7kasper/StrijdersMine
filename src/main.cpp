@@ -9,6 +9,7 @@
 #include <ESP8266mDNS.h> 
 #include <LittleFS.h>
 #include <DNSServer.h>
+#include <EEPROM.h>
 
 // =========================== //
 // =     PIN DEFINITIONS     = //
@@ -27,13 +28,11 @@ const uint8_t PIN_I2C_SCL = 2;              // IO4 (Weird its swapped but whatev
 // =     Mine Definitions    = //
 // =========================== //
 
-static const uint16_t SOLENOID_FIRE_TIME = 500;
-
 static const uint8_t GRID_COLS = 4;
 static const uint8_t GRID_ROWS = 12;
 static const uint8_t SECTION_ROWS = 4;
 static const uint8_t NUM_SECTIONS = GRID_ROWS / SECTION_ROWS;
-static const float DEFAULT_MINE_RATIO = 0.60f;
+// static const float DEFAULT_MINE_RATIO = 0.60f;
 
 static uint8_t currentSection = 0;
 static bool mines[GRID_ROWS][GRID_COLS];
@@ -42,6 +41,63 @@ static bool stepped[GRID_ROWS][GRID_COLS];
 
 // Non-blocking 500 timers for the mines
 static uint32_t relayOffAt[16] = {0};
+
+// =========================== //
+// =      EEPROM Config      = //
+// =========================== //
+
+struct AppConfig {
+    float mineRatio;   // 0.0 .. 1.0
+    uint16_t pulseMs;  // 10 .. 10000
+};
+
+static AppConfig cfg = {0.60f, 500};  // defaults
+static const uint32_t CFG_MAGIC = 0xC0F1A9E1;
+
+static uint8_t cfgChecksum(const AppConfig& c) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&c);
+    uint8_t sum = 0;
+    for (size_t i = 0; i < sizeof(AppConfig); ++i) sum += p[i];
+    return sum;
+}
+
+static void saveConfig() {
+    struct {
+        uint32_t magic;
+        AppConfig c;
+        uint8_t crc;
+    } blob;
+    blob.magic = CFG_MAGIC;
+    blob.c = cfg;
+    blob.crc = cfgChecksum(cfg);
+
+    EEPROM.put(0, blob);
+    EEPROM.commit();
+    Serial.printf("Config saved: ratio=%.2f pulse=%u ms\n", cfg.mineRatio, cfg.pulseMs);
+}
+
+static void loadConfig() {
+    EEPROM.begin(64);
+    struct {
+        uint32_t magic;
+        AppConfig c;
+        uint8_t crc;
+    } blob;
+    EEPROM.get(0, blob);
+    if (blob.magic == CFG_MAGIC && cfgChecksum(blob.c) == blob.crc) {
+        cfg = blob.c;
+        Serial.printf("Config loaded: ratio=%.2f pulse=%u ms\n", cfg.mineRatio,
+                      cfg.pulseMs);
+    } else {
+        Serial.println("Config invalid/missing; using defaults");
+        saveConfig();
+    }
+}
+
+// Debounce (3 samples @ 10 ms poll ≈ 30 ms) 
+static const uint8_t DEB_SAMPLES = 3; 
+static uint8_t debCnt[16] = {0}; 
+static uint16_t debouncedMask = 0;
 
 // =========================== //
 // =     I2C Definitions     = //
@@ -379,6 +435,21 @@ void serviceRelayPulses() {
     }
 }
 
+// Map (row,col) -> relay pin index (0..15) for its section
+static inline uint8_t rowColToPin(uint8_t row, uint8_t col) {
+    uint8_t localRow = row % SECTION_ROWS; // 0..3
+    return (localRow * GRID_COLS) + col;   // 0..15
+}
+
+// Force-blast a tile (always fires relay, sets exploded true)
+static void triggerMineAtRC(uint8_t row, uint8_t col) {
+    if (row >= GRID_ROWS || col >= GRID_COLS) return;
+    uint8_t pin = rowColToPin(row, col);
+    triggerRelayPulse(pin, cfg.pulseMs);
+    exploded[row][col] = true; // keep it latched visually
+    Serial.printf("Force blast row %u col %u -> relay %u\n", row+1, col+1, pin);
+}
+
 // Handle button presses for minefield logic:
 // On rising edge of a button in the current section, if that (row,col) is a mine ->
 // pulse relay 500 ms.
@@ -397,7 +468,7 @@ void handleMinefieldButtons(uint16_t pressedMask) {
                 if (mines[row][col]) {
                     if (!exploded[row][col]) {
                         exploded[row][col] = true;    // latch explosion
-                        triggerRelayPulse(pin, 500);  // 500 ms solenoid pulse
+                        triggerRelayPulse(pin, cfg.pulseMs);  // 500 ms solenoid pulse
                         Serial.printf("Mine EXPLODED: pin %u -> (row %u, col %u)\n",
                                       pin, row + 1, col + 1);
                     } else {
@@ -556,6 +627,8 @@ static void setupWebServer() {
         json += ",\"section\":" + String(currentSection);
         json += ",\"hideOthers\":" + String(hideOtherSections ? "true" : "false");
         json += ",\"debugMode\":" + String(debugMode ? "true" : "false");
+        json += ",\"mineRatio\":" + String(cfg.mineRatio, 3); 
+        json += ",\"pulseMs\":" + String(cfg.pulseMs);
         // mines, exploded, stepped as arrays of 12 integers (4-bit masks per row)
         json += ",\"mines\":[";
         for (uint8_t r = 0; r < GRID_ROWS; r++) {
@@ -614,7 +687,7 @@ static void setupWebServer() {
 
     // Reset field: POST /api/field/reset?ratio=0.6
     server.on("/api/field/reset", HTTP_POST, [](){
-        float ratio = DEFAULT_MINE_RATIO;
+        float ratio = cfg.mineRatio;
         if (server.hasArg("ratio"))
             ratio = server.arg("ratio").toFloat();
         if (ratio < 0.0f)
@@ -623,6 +696,63 @@ static void setupWebServer() {
             ratio = 1.0f;
         resetMinefield(ratio);
         server.send(200, "text/plain", "RESET");
+    });
+
+    server.on("/api/config", HTTP_POST, [](){
+        bool changed = false;
+        if (server.hasArg("mineRatio")) {
+            float r = server.arg("mineRatio").toFloat();
+            if (r < 0.0f)
+                r = 0.0f;
+            if (r > 1.0f)
+                r = 1.0f;
+            cfg.mineRatio = r;
+            changed = true;
+        }
+        if (server.hasArg("pulseMs")) {
+            long ms = server.arg("pulseMs").toInt();
+            if (ms < 10)
+                ms = 10;
+            if (ms > 10000)
+                ms = 10000;
+            cfg.pulseMs = (uint16_t)ms;
+            changed = true;
+        }
+        if (changed)
+            saveConfig();
+        server.send(200, "text/plain", "OK");
+    });
+
+    server.on("/api/field/blast", HTTP_POST,  [](){
+        if (!server.hasArg("row") || !server.hasArg("col")) {
+            server.send(400, "text/plain", "row,col required");
+            return;
+        }
+        int r = server.arg("row").toInt();
+        int c = server.arg("col").toInt();
+        if (r < 0 || r >= GRID_ROWS || c < 0 || c >= GRID_COLS) {
+            server.send(400, "text/plain", "out of range");
+            return;
+        }
+        triggerMineAtRC((uint8_t)r, (uint8_t)c);
+        server.send(200, "text/plain", "OK");
+    });
+
+    server.on("/api/field/blast_all", HTTP_POST, [] () {
+        uint16_t count = 0;
+        for (uint8_t r = 0; r < GRID_ROWS; r++) {
+            for (uint8_t c = 0; c < GRID_COLS; c++) {
+                if (mines[r][c]) {
+                    // Always fire even if already exploded
+                    uint8_t pin = rowColToPin(r, c);  // uses your existing helper
+                    triggerRelayPulse(pin,
+                                    cfg.pulseMs);  // uses your configured pulse duration
+                    exploded[r][c] = true;
+                    count++;
+                }
+            }
+        }
+        server.send(200, "text/plain", String(count));
     });
 
     // Toggle a cell's mine state: POST /api/field/toggle?row=R&col=C
@@ -711,6 +841,9 @@ void setup() {
     relayState = 0x0000;       // all OFF logically
     writeOutputs(relayState);  // push initial state
 
+    // EEPROM setup
+    loadConfig();
+
     // I2C Startup
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     mcpBegin();
@@ -725,7 +858,7 @@ void setup() {
     setupWebServer();
 
     Serial.println("Generating minefield...");
-    resetMinefield(DEFAULT_MINE_RATIO);
+    resetMinefield(cfg.mineRatio);
 
     Serial.println("READY.");
 }
@@ -744,18 +877,36 @@ void loop() {
     static uint32_t lastPoll = 0;
     if (millis() - lastPoll >= 10) {
         lastPoll = millis();
-        uint16_t pressed = getButtonStates();  // 1=pressed for bit i
-        lastButtonsMask = pressed;
+        uint16_t raw = getButtonStates();  // 1 = pressed (raw, noisy)
+        // Per-bit integrator debounce
+        for (uint8_t i = 0; i < 16; i++) {
+            bool pressed = (raw >> i) & 1;
+            if (pressed) {
+                if (debCnt[i] < DEB_SAMPLES)
+                    debCnt[i]++;
+            } else {
+                if (debCnt[i] > 0)
+                    debCnt[i]--;
+            }
+            // Update debounced mask only at stable extremes
+            if (debCnt[i] == DEB_SAMPLES)
+                debouncedMask |= (1U << i);
+            else if (debCnt[i] == 0)
+                debouncedMask &= ~(1U << i);
+        }
+        lastButtonsMask = debouncedMask;        // expose debounced to UI
+        
         if (debugMode) {
             // Hold-to-activate: pressed => relay ON
-            relayState = pressed;
+            relayState = lastButtonsMask;
             writeOutputs(relayState);
         } else {
-            handleMinefieldButtons(pressed);
+            handleMinefieldButtons(lastButtonsMask);
             // Turn off relays whose pulses expired
             serviceRelayPulses();
         }
     }
+
 
 
     // // Demo: blink RELAY_0, keep RELAY_F ON for 3s then OFF for 3s
