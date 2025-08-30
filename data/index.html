@@ -424,44 +424,67 @@
 
         let lpTimer = null;
         let lpFired = false;
-        let lpRC = null; // remember which tile started press
+        let lpRC = null;               // {r,c} set on pointerdown
+        let activePointerId = null;    // track which pointer we’re handling
+        let squelchClick = false;      // ignore synthetic click after pointer handling
 
         grid.addEventListener('pointerdown', (e) => {
             const cell = e.target.closest('.cell');
             if (!cell) return;
+
+            activePointerId = e.pointerId ?? 1;
             const r = parseInt(cell.dataset.r, 10);
             const c = parseInt(cell.dataset.c, 10);
-            lpFired = false;
             lpRC = { r, c };
+            lpFired = false;
 
+            // Start long-press timer (explode only if currently a mine)
             lpTimer = setTimeout(async () => {
                 lpFired = true;
-                // Only explode if it is currently a mine
                 const isMine = ((lastMines[r] >>> c) & 1) === 1;
                 if (isMine) {
-                    await fetch(`/api/field/blast?row=${ r }&col=${ c }`, { method: 'POST' });
+                    await fetch(`/api/field/blast?row=${r}&col=${c}`, { method: 'POST' });
                     if (typeof playExplosion === 'function') playExplosion();
                     fetchField();
                 } else {
-                    // optional: play a soft click to indicate "no mine"
                     if (typeof playClick === 'function') playClick();
                 }
-            }, 550); // long-press threshold
+            }, 550);
         }, { passive: true });
 
-        ['pointerup', 'pointerleave', 'pointercancel'].forEach(evt => {
-            grid.addEventListener(evt, async (e) => {
-                if (!lpRC) return;
+        // Handle gesture end anywhere (not just on the grid)
+        function onPointerEnd(e) {
+            if (activePointerId === null || (e.pointerId ?? 1) !== activePointerId) return;
+            if (lpTimer) {
+                clearTimeout(lpTimer);
+                lpTimer = null;
+            }
+            if (lpRC && !lpFired) {
+                // Short press -> toggle mine
                 const { r, c } = lpRC;
-                if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
-                // Short press: toggle mine (only if long press didn't trigger)
-                if (!lpFired) {
-                    await fetch(`/api/field/toggle?row=${ r } &col=${ c }`, { method: 'POST' });
-                    fetchField();
-                }
-                lpRC = null;
-            }, { passive: true });
-        });
+                fetch(`/api/field/toggle?row=${r}&col=${c}`, { method: 'POST' }).then(fetchField);
+                squelchClick = true;             // suppress following synthetic click
+                setTimeout(() => squelchClick = false, 300);
+            }
+            lpRC = null;
+            lpFired = false;
+            activePointerId = null;
+        }
+
+        // Listen at window so we don’t miss events
+        window.addEventListener('pointerup', onPointerEnd, true);
+        window.addEventListener('pointercancel', onPointerEnd, true);
+        window.addEventListener('pointerleave', onPointerEnd, true);
+
+        // Click fallback (for browsers that don’t deliver pointer events reliably)
+        grid.addEventListener('click', (e) => {
+            if (squelchClick) return;           // already handled via pointer events
+            const cell = e.target.closest('.cell');
+            if (!cell) return;
+            const r = parseInt(cell.dataset.r, 10);
+            const c = parseInt(cell.dataset.c, 10);
+            fetch(`/api/field/toggle?row=${r}&col=${c}`, { method: 'POST' }).then(fetchField);
+        }, { passive: true });
 
         const hideOthersEl = document.getElementById('hideOthers');
         hideOthersEl.addEventListener('change', async () => {
@@ -523,7 +546,7 @@
                 const mines = (s.mines || []).map(x => x | 0);
                 const exploded = (s.exploded || []).map(x => x | 0);
                 const stepped = (s.stepped || []).map(x => x | 0);
-                lastMines = mines.slice();
+                lastMines = (s.mines || []).map(x => x | 0);
                 const hideOthers = !!s.hideOthers;
                 hideOthersEl.checked = hideOthers;
                 const debugMode = !!s.debugMode;
